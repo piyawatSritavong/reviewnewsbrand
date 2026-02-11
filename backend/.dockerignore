@@ -1,0 +1,6 @@
+venv/
+myenv/
+*.png
+*.db
+*.log
+sa.json
