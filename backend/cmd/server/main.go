@@ -1,29 +1,30 @@
 package main
 
 import (
-	"context"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
-	"log"
-	"math/rand"
-	"os"
-	"strconv"
-	"strings"
-	"time"
+  "context"
+  "encoding/json"
+  "fmt"
+  "io"
+  "log"
+  "math/rand"
+  "net/http"
+  "os"
+  "strconv"
+  "strings"
+  "time"
 
-	"backend/internal/database"
-	"backend/internal/models"
+  "backend/internal/database"
+  "backend/internal/models"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/generative-ai-go/genai"
-	"github.com/joho/godotenv"
-	"github.com/robfig/cron/v3"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"google.golang.org/api/option"
+  "github.com/gin-gonic/gin"
+  "github.com/google/generative-ai-go/genai"
+  "github.com/joho/godotenv"
+  "github.com/robfig/cron/v3"
+  "go.mongodb.org/mongo-driver/bson"
+  "go.mongodb.org/mongo-driver/bson/primitive"
+  "go.mongodb.org/mongo-driver/mongo"
+  "go.mongodb.org/mongo-driver/mongo/options"
+  "google.golang.org/api/option"
 )
 
 var (
@@ -106,6 +107,7 @@ func main() {
 	}
 
 	r := gin.Default()
+	_ = r.SetTrustedProxies(nil)
 
 	// CORS Setup
 	r.Use(func(c *gin.Context) {
@@ -259,58 +261,84 @@ func generateContentOnly(topic, basePrompt string, wordLimit int) (string, error
 }
 
 // Gemini/Imagen สร้าง “image” อย่างเดียว แล้วคืนค่าเป็น data URL (base64)
+// Gemini/Imagen สร้าง “image” อย่างเดียว แล้วคืนค่าเป็น data URL (base64)
 func generateImageOnly(imagePrompt string) (string, error) {
-	if geminiClient == nil {
-		return "", fmt.Errorf("gemini client is nil")
+	key := os.Getenv("GEMINI_API_KEY")
+	if strings.TrimSpace(key) == "" {
+		return "", fmt.Errorf("GEMINI_API_KEY is empty")
 	}
+
 	prompt := strings.TrimSpace(imagePrompt)
 	if prompt == "" {
 		return "", fmt.Errorf("image prompt is empty")
 	}
 
-	imageModelName := os.Getenv("GEMINI_IMAGE_MODEL")
-	if imageModelName == "" {
-		imageModelName = "imagen-3.0-generate-002"
+	// Imagen model (ใช้ตาม docs:predict)
+	model := os.Getenv("GEMINI_IMAGE_MODEL")
+	if model == "" {
+		model = "imagen-4.0-generate-001"
 	}
 
-	imageModel := geminiClient.GenerativeModel(imageModelName)
-	// ช่วยบังคับให้คืนเป็นรูป
-	imageModel.ResponseMIMEType = "image/png"
+	endpoint := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:predict", model)
 
-	imgCtx, imgCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer imgCancel()
+	// request body
+	reqBody := map[string]any{
+		"instances": []map[string]any{
+			{"prompt": prompt},
+		},
+		"parameters": map[string]any{
+			"sampleCount": 1,
+		},
+	}
 
-	imgResp, err := imageModel.GenerateContent(imgCtx, genai.Text(prompt))
+	b, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", err
 	}
 
-	var blob *genai.Blob
-	if len(imgResp.Candidates) > 0 && imgResp.Candidates[0].Content != nil {
-		for _, part := range imgResp.Candidates[0].Content.Parts {
-			switch v := part.(type) {
-			case genai.Blob:
-				vv := v
-				blob = &vv
-			case *genai.Blob:
-				blob = v
-			}
-			if blob != nil {
-				break
-			}
-		}
+	httpReq, err := http.NewRequest("POST", endpoint, strings.NewReader(string(b)))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", key)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("imagen predict failed: status=%d body=%s", resp.StatusCode, string(raw))
 	}
 
-	if blob == nil || len(blob.Data) == 0 {
-		return "", fmt.Errorf("no image blob returned")
+	// response shape:
+	// {
+	//   "predictions":[{"bytesBase64Encoded":"...","mimeType":"image/png"}]
+	// }
+	var out struct {
+		Predictions []struct {
+			BytesBase64Encoded string `json:"bytesBase64Encoded"`
+			MimeType           string `json:"mimeType"`
+		} `json:"predictions"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("cannot parse imagen response: %v body=%s", err, string(raw))
 	}
 
-	mime := blob.MIMEType
-	if mime == "" {
+	if len(out.Predictions) == 0 || out.Predictions[0].BytesBase64Encoded == "" {
+		return "", fmt.Errorf("no image returned (empty predictions)")
+	}
+
+	mime := out.Predictions[0].MimeType
+	if strings.TrimSpace(mime) == "" {
 		mime = "image/png"
 	}
-	b64 := base64.StdEncoding.EncodeToString(blob.Data)
-	dataURL := fmt.Sprintf("data:%s;base64,%s", mime, b64)
+
+	dataURL := fmt.Sprintf("data:%s;base64,%s", mime, out.Predictions[0].BytesBase64Encoded)
 	return dataURL, nil
 }
 
